@@ -41,6 +41,8 @@ import java.util.List;
  */
 public class HelloCancellationScope {
 
+  public static final String CANCEL_CONST = "CANCEL";
+
   // Define the task queue name
   static final String TASK_QUEUE = "HelloCancellationScopeTaskQueue";
 
@@ -50,19 +52,22 @@ public class HelloCancellationScope {
   private static final int ACTIVITY_MAX_SLEEP_SECONDS = 30;
   private static final int ACTIVITY_MAX_CLEANUP_SECONDS = 5;
   private static final int ACTIVITY_START_TO_CLOSE_TIMEOUT =
-      ACTIVITY_MAX_SLEEP_SECONDS + ACTIVITY_MAX_CLEANUP_SECONDS + 10;
+          ACTIVITY_MAX_SLEEP_SECONDS + ACTIVITY_MAX_CLEANUP_SECONDS + 10;
 
   private static final String[] greetings =
-      new String[] {
-        "Hallo1", "Hallo2", "Hallo3", "Hallo4", "Hallo5", "Hallo6", "Hallo7", "Hallo8", "Hallo9",
-        "Hallo10", "Hallo11", "Hallo12", "Hallo13", "Hallo14", "Hallo15", "Hallo16", "Hallo17",
-        "Hallo18", "Hallo19", "Hallo20", "Hallo21", "Hallo22", "Hallo23", "Hallo24"
-      };
+          new String[] {
+                  "Hallo1", "Hallo2", "Hallo3", "Hallo4", "Hallo5", "Hallo6", "Hallo7", "Hallo8", "Hallo9",
+                  "Hallo10", "Hallo11", "Hallo12", "Hallo13", "Hallo14", "Hallo15", "Hallo16", "Hallo17",
+                  "Hallo18", "Hallo19", "Hallo20", "Hallo21", "Hallo22", "Hallo23", "Hallo24"
+          };
 
   @WorkflowInterface
   public interface ParentWorkflow {
     @WorkflowMethod
     String runParentWorkflow(String name);
+
+    @SignalMethod
+    void cancel();
   }
 
   @WorkflowInterface
@@ -76,42 +81,44 @@ public class HelloCancellationScope {
     @Override
     public String runChildWorkflow(String parentName) {
       final GreetingActivities activities =
-          Workflow.newActivityStub(
-              GreetingActivities.class,
-              ActivityOptions.newBuilder()
-                  .setStartToCloseTimeout(Duration.ofSeconds(ACTIVITY_START_TO_CLOSE_TIMEOUT))
-                  .setCancellationType(ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
-                  .setRetryOptions(
-                      RetryOptions.newBuilder().setMaximumAttempts(1).setDoNotRetry().build())
-                  .build());
+              Workflow.newActivityStub(
+                      GreetingActivities.class,
+                      ActivityOptions.newBuilder()
+                              .setStartToCloseTimeout(Duration.ofSeconds(ACTIVITY_START_TO_CLOSE_TIMEOUT))
+                              .setCancellationType(ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
+                              .setRetryOptions(
+                                      RetryOptions.newBuilder().setMaximumAttempts(1).setDoNotRetry().build())
+                              .build());
       System.out.println("Inside child workflow: Start of workflow method");
       List<Promise<String>> results = new ArrayList<>(greetings.length);
+      // trigger a bunch of parallel activities and wait for their completion
       for (String greeting : greetings) {
         System.out.println("Scheduling greeting Activity: " + greeting);
         results.add(
-            Async.function(
-                () -> {
-                  String result = activities.greetingActivity(greeting, "dummyname");
-                  return handleActivityResult(result);
-                }));
+                Async.function(
+                        () -> {
+                          String result = activities.greetingActivity(greeting, "dummyname");
+                          return handleActivityResult(result);
+                        }));
       }
       // wait for all activities to complete
       System.out.println(
-          "Inside child workflow: scheduled and waiting for activities to compelete");
+              "Inside child workflow: scheduled and waiting for activities to compelete");
       results.forEach(Promise::get);
       System.out.println("Inside child workflow: Got all results");
       return "RAN CHILD WORFLOW SUCCESSFULLY";
     }
 
+    //triggers a local activity to send an external message
     private String handleActivityResult(String result) {
       MsgActivities msgActivty =
-          Workflow.newLocalActivityStub(
-              MsgActivities.class,
-              LocalActivityOptions.newBuilder()
-                  .setStartToCloseTimeout(Duration.ofMinutes(1))
-                  .setRetryOptions(
-                      RetryOptions.newBuilder().setMaximumAttempts(1).setDoNotRetry().build())
-                  .build());
+              Workflow.newLocalActivityStub(
+                      MsgActivities.class,
+                      LocalActivityOptions.newBuilder()
+                              .setStartToCloseTimeout(Duration.ofMinutes(1))
+                              .setRetryOptions(
+                                      RetryOptions.newBuilder().setMaximumAttempts(1).setDoNotRetry().build())
+                              .build());
       return msgActivty.sendMsg(result, "Dummy Message");
     }
   }
@@ -144,9 +151,17 @@ public class HelloCancellationScope {
 
     public ParentWorkflowImpl() {}
 
+    // this string will be null but will be set to CANCEL_CONST str when the cancel signal method is
+    // called
+    // once this cancelString is set to CANCEL_CONST, the cancellationscope that is executing will
+    // be cancelled
+    // the cancellation scope is executing child workflow(which inturn has scheduled activities) and
+    // the cancellation
+    // scope should stop its execution
+    private String cancelString = " ";
+
     @Override
     public String runParentWorkflow(String name) {
-      System.out.println("Inside Parent workflow:");
       System.out.println("Inside Parent workflow: inside runParentGreeting method");
       List<Promise<Void>> results = new ArrayList<>(greetings.length);
       /*
@@ -155,28 +170,28 @@ public class HelloCancellationScope {
        * languages.
        */
       CancellationScope scope =
-          Workflow.newCancellationScope(
-              () -> {
-                System.out.println("Inside Parent workflow: start of cancellation scope");
-                final ChildWorkflowOptions childWorkflowOptions =
-                    ChildWorkflowOptions.newBuilder()
-                        .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(1).build())
-                        .setCancellationType(
-                            ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED)
-                        .setTaskQueue(TASK_QUEUE)
-                        .build();
-                ChildWorkflow cwf =
-                    Workflow.newChildWorkflowStub(ChildWorkflow.class, childWorkflowOptions);
-                Promise<Void> result =
-                    Async.procedure(cwf::runChildWorkflow, "ChildWorkflowGreetingArgument");
-                results.add(result);
-                // This is to wait till the execution of the workflow starts and NOT wait for the
-                // workflow to complete
-                // execution
-                Promise<WorkflowExecution> executionPromise = Workflow.getWorkflowExecution(cwf);
-                executionPromise.get();
-                System.out.println("Inside Parent workflow: scheduled child workflow execution");
-              });
+              Workflow.newCancellationScope(
+                      () -> {
+                        System.out.println("Inside Parent workflow: start of cancellation scope");
+                        final ChildWorkflowOptions childWorkflowOptions =
+                                ChildWorkflowOptions.newBuilder()
+                                        .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(1).build())
+                                        .setCancellationType(
+                                                ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED)
+                                        .setTaskQueue(TASK_QUEUE)
+                                        .build();
+                        ChildWorkflow cwf =
+                                Workflow.newChildWorkflowStub(ChildWorkflow.class, childWorkflowOptions);
+                        Promise<Void> result =
+                                Async.procedure(cwf::runChildWorkflow, "ChildWorkflowGreetingArgument");
+                        results.add(result);
+                        // This is to wait till the execution of the workflow starts and NOT wait for the
+                        // workflow to complete
+                        // execution
+                        Promise<WorkflowExecution> executionPromise = Workflow.getWorkflowExecution(cwf);
+                        executionPromise.get();
+                        System.out.println("Inside Parent workflow: scheduled child workflow execution");
+                      });
 
       /*
        * Execute all activities within the CancellationScope. Note that this execution is
@@ -185,10 +200,14 @@ public class HelloCancellationScope {
       scope.run();
       System.out.println("Inside Parent workflow: scope run started");
 
-      Workflow.sleep(5000);
-      System.out.println("Inside Parent workflow: parent workflow sleep complete");
-
-      // Trigger cancellation of all uncompleted activity invocations within the cancellation scope
+      // wait for the cancel() signal method to be called on the parentworkflow. the signal method
+      // will set the CANCEL_CONST string
+      Workflow.await(
+              () -> {
+                System.out.println("waiting for cancel");
+                return CANCEL_CONST.equalsIgnoreCase(cancelString);
+              });
+      System.out.println("RECEIVED CANCEL");
       scope.cancel();
       System.out.println("Inside Parent workflow: scope cancel done");
 
@@ -200,12 +219,13 @@ public class HelloCancellationScope {
 
       return "CANCEL COMPLETE";
     }
+
+    public void cancel() {
+      System.out.println("CANCEL SIGNAL METHOD CALLED");
+      cancelString = CANCEL_CONST;
+    }
   }
 
-  /**
-   * Implementation of our workflow activity interface. It overwrites our defined composeGreeting
-   * method.
-   */
   public static class GreetingActivitiesImpl implements GreetingActivities {
 
     @Override
@@ -221,6 +241,7 @@ public class HelloCancellationScope {
           // Perform the heartbeat. Used to notify the workflow that activity execution is alive
           context.heartbeat(i);
         } catch (ActivityCompletionException e) {
+          // complete any cleanup
           System.out.println("start cleanup" + greeting);
           sleep(seconds);
           System.out.println("End cleanup" + greeting);
@@ -241,19 +262,15 @@ public class HelloCancellationScope {
     }
   }
 
-  /**
-   * With our Workflow and Activities defined, we can now start execution. The main method starts
-   * the worker and then the workflow.
-   */
   public static void main(String[] args) {
 
     WorkflowServiceStubs service = WorkflowServiceStubs.newLocalServiceStubs();
     WorkflowClient client = WorkflowClient.newInstance(service);
     WorkerFactory factory = WorkerFactory.newInstance(client);
     Worker worker =
-        factory.newWorker(
-            TASK_QUEUE,
-            WorkerOptions.newBuilder().setMaxConcurrentActivityExecutionSize(2).build());
+            factory.newWorker(
+                    TASK_QUEUE,
+                    WorkerOptions.newBuilder().setMaxConcurrentActivityExecutionSize(2).build());
 
     worker.registerWorkflowImplementationTypes(ParentWorkflowImpl.class);
     worker.registerWorkflowImplementationTypes(ChildWorkflowImpl.class);
@@ -261,31 +278,30 @@ public class HelloCancellationScope {
     worker.registerActivitiesImplementations(new MsgActivitiesImpl());
     factory.start();
 
-    // Create the workflow client stub. It is used to start our workflow execution.
+    // Create the workflow client stub. It is used to start our workflow execution asynchronously.
     ParentWorkflow workflow =
-        client.newWorkflowStub(
-            ParentWorkflow.class,
-            WorkflowOptions.newBuilder()
-                .setWorkflowId(WORKFLOW_ID)
-                .setTaskQueue(TASK_QUEUE)
-                .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(1).build())
-                .build());
+            client.newWorkflowStub(
+                    ParentWorkflow.class,
+                    WorkflowOptions.newBuilder()
+                            .setWorkflowId(WORKFLOW_ID)
+                            .setTaskQueue(TASK_QUEUE)
+                            .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(1).build())
+                            .build());
 
-    /*
-     * Execute our workflow and wait for it to complete. The call to our getGreeting method is
-     * synchronous.
-     */
-    System.out.println("Started PArent Greeting workflow");
-    String greeting = null;
+    System.out.println("Starting workflow");
+    WorkflowClient.execute(workflow::runParentWorkflow, "World");
+    System.out.println("WORKFLOW IN PROGRESS");
+
+    // ######################## CANCEL WORKFLOW
+    // wait for 5 seconds and then cancel
     try {
-      greeting = workflow.runParentWorkflow("World");
-    } catch (Exception e) {
-      System.out.println("PArent Greeting workflow; INSIDE EXCEPTION BLOCK");
+      Thread.sleep(5000);
+    } catch (InterruptedException e) {
+      e.printStackTrace();
     }
-    System.out.println("END of PArent Greeting workflow");
-
-    // Display workflow execution results
-    System.out.println(greeting);
-    System.exit(0);
+    System.out.println("About to cancel PARENT WORKFLOW");
+    ParentWorkflow existingwfl = client.newWorkflowStub(ParentWorkflow.class, WORKFLOW_ID);
+    existingwfl.cancel();
+    System.out.println("cancel RETURNED");
   }
 }
